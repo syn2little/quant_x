@@ -5,6 +5,35 @@ import pandas as pd
 import ta  # pip install ta
 
 class MultiStockEnv(gym.Env):
+    def evaluate_performance(self, asset_curve=None, risk_free_rate=0.02):
+        """
+        回测指标评估：输入资产净值序列，输出收益率、最大回撤、夏普比率等。
+        asset_curve: list 或 np.array，记录每步的总资产（如回测时每步 self.total_asset）
+        risk_free_rate: 年化无风险利率，默认2%
+        """
+        if asset_curve is None:
+            raise ValueError("请传入资产净值序列 asset_curve")
+        asset_curve = np.array(asset_curve)
+        returns = np.diff(asset_curve) / asset_curve[:-1]
+        cum_return = asset_curve[-1] / asset_curve[0] - 1
+        # 最大回撤
+        high_water = np.maximum.accumulate(asset_curve)
+        drawdowns = (asset_curve - high_water) / high_water
+        max_drawdown = drawdowns.min()
+        # 夏普比率（假设252个交易日）
+        mean_return = returns.mean() * 252
+        std_return = returns.std() * np.sqrt(252)
+        sharpe = (mean_return - risk_free_rate) / (std_return + 1e-8)
+        # 收益波动率
+        volatility = returns.std() * np.sqrt(252)
+        # 输出结果
+        result = {
+            "累计收益率": cum_return,
+            "最大回撤": max_drawdown,
+            "年化波动率": volatility,
+            "夏普比率": sharpe,
+        }
+        return result
     metadata = {"render_modes": ["human"]}
 
     def __init__(
