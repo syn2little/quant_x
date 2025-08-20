@@ -11,7 +11,7 @@ class MultiStockEnv(gym.Env):
         self,
         df_dict,
         tickers,
-        window_size=10,
+        window_size=30,
         initial_cash=1_000_000,
         fee_ratio=0.001,
         slippage=0.005
@@ -25,13 +25,14 @@ class MultiStockEnv(gym.Env):
         self.fee_ratio = fee_ratio
         self.slippage = slippage
 
-        # 数据预处理：技术指标
+        # 自动识别所有因子特征（去除非数值型和索引列）
+        sample_df = next(iter(self.df_dict.values()))
+        self.feature_cols = [c for c in sample_df.columns if c not in ["datetime", "instrument"] and np.issubdtype(sample_df[c].dtype, np.number)]
+        self.feature_dims = len(self.feature_cols)
+
+        # 填充缺失值
         for t in tickers:
             df = self.df_dict[t].copy()
-            df.columns = [c.lower() for c in df.columns]  # 小写统一
-            df["ma"] = ta.trend.sma_indicator(df["close"], window=5)
-            df["macd"] = ta.trend.macd_diff(df["close"])
-            df["rsi"] = ta.momentum.rsi(df["close"])
             df.fillna(0, inplace=True)
             self.df_dict[t] = df
 
@@ -43,7 +44,6 @@ class MultiStockEnv(gym.Env):
         )
 
         # Observation空间：每支股票的 window_size * feature_dim + cash_ratio + 当前持仓比例
-        self.feature_dims = 8  # adjclose, open, high, low, volume, ma, macd, rsi
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -53,7 +53,9 @@ class MultiStockEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.current_step = self.window_size
+        # 随机选择一个合法的起始时间点
+        rng = np.random.default_rng(seed)
+        self.current_step = rng.integers(self.window_size, self.max_steps)
         self.cash = self.initial_cash
         self.stocks_held = np.zeros(self.num_stocks, dtype=np.float32)
         self.total_asset = self.cash
@@ -106,17 +108,19 @@ class MultiStockEnv(gym.Env):
 
     def _get_current_prices(self):
         return np.array([
-            self.df_dict[t].loc[self.current_step, "close"] for t in self.tickers
+            self.df_dict[t].loc[self.current_step, "$adjclose"] for t in self.tickers
         ])
 
     def _get_observation(self):
-        features = []
-        for t in self.tickers:
+        import concurrent.futures
+        def get_features(t):
             df = self.df_dict[t]
             slice = df.iloc[self.current_step - self.window_size:self.current_step]
-            f = slice[["close", "open", "high", "low", "volume", "ma", "macd", "rsi"]].values
-            features.append(f)
-        features = np.hstack(features)
+            return slice[self.feature_cols].values
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            features_list = list(executor.map(get_features, self.tickers))
+        features = np.hstack(features_list)
 
         price_now = self._get_current_prices()
         stock_val = price_now * self.stocks_held
