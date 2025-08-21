@@ -1,4 +1,4 @@
-cd ~
+cd /Users/weidian/code/algorithms/quant/qlib
 SAVE_PATH=qlib_bin.tar.gz
 DATA_PATH=qlib_data/cn_data
 

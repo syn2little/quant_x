@@ -40,6 +40,7 @@ class MultiStockEnv(gym.Env):
         self,
         df_dict,
         tickers,
+        trade_tickers,
         window_size=30,
         initial_cash=1_000_000,
         fee_ratio=0.001,
@@ -47,8 +48,9 @@ class MultiStockEnv(gym.Env):
     ):
         super().__init__()
         self.df_dict = df_dict  # dict of {ticker: df}
-        self.tickers = tickers
-        self.num_stocks = len(tickers)
+        self.tickers = tickers  # 所有股票
+        self.trade_tickers = trade_tickers  # 实际交易的股票
+        self.num_stocks = len(trade_tickers)  # 实际交易的股票数量
         self.window_size = window_size
         self.initial_cash = initial_cash
         self.fee_ratio = fee_ratio
@@ -56,7 +58,7 @@ class MultiStockEnv(gym.Env):
 
         # 自动识别所有因子特征（去除非数值型和索引列）
         sample_df = next(iter(self.df_dict.values()))
-        self.feature_cols = [c for c in sample_df.columns if c not in ["datetime", "instrument"] and np.issubdtype(sample_df[c].dtype, np.number)]
+        self.feature_cols = [c for c in sample_df.columns if c not in ["datetime", "instrument", "$adjclose"] and np.issubdtype(sample_df[c].dtype, np.number)]
         self.feature_dims = len(self.feature_cols)
 
         # 填充缺失值
@@ -67,29 +69,48 @@ class MultiStockEnv(gym.Env):
 
         self.max_steps = min([len(df) for df in self.df_dict.values()]) - window_size - 1
 
-        # 连续动作空间：每支股票目标持仓比例
+        # 连续动作空间：每支交易股票目标持仓比例
         self.action_space = spaces.Box(
             low=0.0, high=1.0, shape=(self.num_stocks,), dtype=np.float32
         )
 
-        # Observation空间：每支股票的 window_size * feature_dim + cash_ratio + 当前持仓比例
+        # Observation空间：所有股票的 window_size * feature_dim + cash_ratio + 当前持仓比例
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self.window_size, self.num_stocks * self.feature_dims + 1 + self.num_stocks),
+            shape=(self.window_size, len(self.tickers) * self.feature_dims + 1 + self.num_stocks),
             dtype=np.float32
         )
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        # 随机选择一个合法的起始时间点
-        rng = np.random.default_rng(seed)
-        self.current_step = rng.integers(self.window_size, self.max_steps)
-        self.cash = self.initial_cash
-        self.stocks_held = np.zeros(self.num_stocks, dtype=np.float32)
-        self.total_asset = self.cash
-        self.done = False
-        return self._get_observation(), {}
+    def _get_current_prices(self):
+        # 返回 trade_tickers 的当前价格
+        return np.array([
+            self.df_dict[t].loc[self.current_step, "$adjclose"] for t in self.trade_tickers
+        ])
+
+    def _get_observation(self):
+        import concurrent.futures
+        def get_features(t):
+            df = self.df_dict[t]
+            slice = df.iloc[self.current_step - self.window_size:self.current_step]
+            return slice[self.feature_cols].values
+
+        # 获取所有 tickers 的因子数据
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            features_list = list(executor.map(get_features, self.tickers))
+        features = np.hstack(features_list)
+
+        # 获取 trade_tickers 的持仓信息
+        price_now = self._get_current_prices()
+        stock_val = price_now * self.stocks_held
+        total_val = self.cash + np.sum(stock_val)
+        allocation = stock_val / (total_val + 1e-8)
+        cash_ratio = np.array([[self.cash / (total_val + 1e-8)] for _ in range(self.window_size)])
+        alloc_matrix = np.tile(allocation, (self.window_size, 1))
+
+        # 合并 observation
+        obs = np.concatenate([features, cash_ratio, alloc_matrix], axis=1)
+        return obs.astype(np.float32)
 
     def step(self, action):
         action = np.clip(action, 0.0, 1.0)
@@ -134,32 +155,20 @@ class MultiStockEnv(gym.Env):
         self.done = terminated
 
         return self._get_observation(), reward, terminated, False, {}
-
-    def _get_current_prices(self):
-        return np.array([
-            self.df_dict[t].loc[self.current_step, "$adjclose"] for t in self.tickers
-        ])
-
-    def _get_observation(self):
-        import concurrent.futures
-        def get_features(t):
-            df = self.df_dict[t]
-            slice = df.iloc[self.current_step - self.window_size:self.current_step]
-            return slice[self.feature_cols].values
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            features_list = list(executor.map(get_features, self.tickers))
-        features = np.hstack(features_list)
-
-        price_now = self._get_current_prices()
-        stock_val = price_now * self.stocks_held
-        total_val = self.cash + np.sum(stock_val)
-        allocation = stock_val / (total_val + 1e-8)
-        cash_ratio = np.array([[self.cash / (total_val + 1e-8)] for _ in range(self.window_size)])
-        alloc_matrix = np.tile(allocation, (self.window_size, 1))
-
-        obs = np.concatenate([features, cash_ratio, alloc_matrix], axis=1)
-        return obs.astype(np.float32)
+    
+    def reset(self, seed=None, options=None, eval=False):
+        if not eval:
+            super().reset(seed=seed)
+            # 随机选择一个合法的起始时间点
+            rng = np.random.default_rng(seed)
+            self.current_step = rng.integers(self.window_size, self.max_steps)
+        else:
+            self.current_step = self.window_size
+        self.cash = self.initial_cash
+        self.stocks_held = np.zeros(self.num_stocks, dtype=np.float32)
+        self.total_asset = self.cash
+        self.done = False
+        return self._get_observation(), {}
 
     def render(self):
         print(
